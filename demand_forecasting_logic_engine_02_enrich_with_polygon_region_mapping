@@ -1,0 +1,489 @@
+CREATE OR REPLACE TABLE           binimdwh.modelling.fnv_forecast_base
+PARTITION BY date_
+CLUSTER BY wh_code, sku AS (
+ WITH base AS (
+   SELECT a.country_code, wh_code, date_, a.sku, b.category, wt_b_avail as wt_avail, units_sold, units_liq, units_event, COALESCE(asp,0) as asp, COALESCE(liq_asp,0) as liq_asp, COALESCE(event_asp,0) as event_asp, tot_orders
+   FROM           binimdwh.modelling.forecast_base a
+   JOIN (
+     SELECT LOWER(country_code) as country_code, sku, INITCAP(REPLACE(category, "_", " ")) as category
+     FROM           biinstnt.minutes.minutes_commercial_category_mapping
+     WHERE INITCAP(REPLACE(category, "_", " ")) IN ("Fruit & Vegetables")
+     GROUP BY 1,2,3
+   ) b ON a.sku = b.sku AND a.country_code = b.country_code
+   WHERE date_ BETWEEN CURRENT_DATE("Asia/Dubai") - 90 AND CURRENT_DATE("Asia/Dubai") - 1
+   and date_ not in ('2025-03-29', '2025-03-30','2025-03-31')
+   AND a.country_code IN ("ae","sa")
+ ),
+ sub_category_mapping AS (
+   SELECT DISTINCT country_code, sku, sub_category
+   FROM (
+     SELECT DISTINCT ROW_NUMBER() OVER (PARTITION BY country_code, sku ORDER BY id_product_category ASC) as rank, country_code, sku, pc.id_category, id_product_category, IFNULL(cat.category,"-") AS category, IFNULL(cat.sub_category,"-") AS sub_category,
+     FROM           dwh.instant_instant_catalog.product_category_v2 pc
+     LEFT JOIN (
+       SELECT cat1.country_code, cat1.id_category, cat1.id_category_parent, cat1.en_name AS sub_category, cat2.en_name AS category
+       FROM           dwh.instant_instant_catalog.category_v2 cat1
+       LEFT JOIN           dwh.instant_instant_catalog.category_v2 cat2 ON cat1.id_category_parent = cat2.id_category
+     ) cat USING (id_category)
+     WHERE is_active = 1
+   )
+   WHERE country_code IN ("ae","sa") AND rank = 1
+ ),
+ sku_tiering AS (
+   SELECT country_code, sku,
+   CASE
+     WHEN (cumulative_sales / total_sales) <= 0.8 then 'top'
+     WHEN (cumulative_sales / total_sales) <= 0.90 then 'mid'
+     ELSE 'bottom'
+   END as sku_tier
+   FROM (
+     SELECT country_code, sku, sales, SUM(sales) OVER (PARTITION BY country_code ORDER BY sales DESC) as cumulative_sales, SUM(sales) OVER (PARTITION BY country_code) as total_sales
+     FROM (
+       SELECT country_code, sku, SUM(units_sold) as sales
+       FROM base
+       WHERE date_ NOT BETWEEN DATE("2024-11-01") AND DATE("2024-11-30")
+       GROUP BY 1,2
+     )
+   )
+ )
+ SELECT a.country_code, a.date_, a.wh_code, a.sku, COALESCE(sku_tier,'bottom') as sku_tier, a.category, scm.sub_category, units_sold, units_liq, units_event, asp, liq_asp, event_asp, wt_avail, tot_orders, (CURRENT_TIMESTAMP + INTERVAL 4 HOUR) as updated_at
+ FROM base a
+ LEFT JOIN sub_category_mapping scm ON scm.sku = a.sku AND scm.country_code = a.country_code
+ LEFT JOIN sku_tiering st ON st.sku = a.sku AND st.country_code = a.country_code
+ GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+)
+'''
+[[bqsql]]
+dag_id = 'forecast_data_prep'
+task_id = 'fnv_dow_normalization'
+depends = ['fnv_base_data']
+sql = '''
+CREATE OR REPLACE TABLE           binimdwh.modelling.fnv_dow_normalization AS (
+WITH sales_base AS (
+   SELECT so.country_code, CASE WHEN so.country_code IN ("sa") THEN DATE(so.created_at + INTERVAL 3 HOUR) ELSE DATE(so.created_at + INTERVAL 4 HOUR) END as date_, REGEXP_EXTRACT(address_key, r'^[^-]*') as address_code, SAFE_CAST(REGEXP_EXTRACT(address_key,"-(.+)") as int64) as address_version, order_nr, sku
+   FROM           dwh.instant_instant_order.sales_order so
+   JOIN           dwh.instant_instant_order.sales_order_item soi ON soi.id_sales_order = so.id_sales_order
+   WHERE DATE(so.created_at + INTERVAL 4 HOUR) BETWEEN CURRENT_DATE("Asia/Dubai") - 80 AND CURRENT_DATE("Asia/Dubai") - 1 
+   AND so.status_code_order = "delivered"
+   AND so.country_code IN ("ae","sa")
+   AND soi.cancel_reason_code IS NULL
+   GROUP BY 1,2,3,4,5,6
+ ),
+ order_lat_long AS (
+   SELECT country_code, date_, order_nr, sku, lat, lng
+   FROM sales_base sb
+   JOIN           dwh.customerexposed_customer_hashed.address_history ca ON sb.address_code = ca.address_code AND sb.address_version = ca.v_customer_address
+   GROUP BY 1,2,3,4,5,6
+ ),
+ polygon_ds AS (
+   SELECT wh_code, polygon
+   FROM           dwh.instant_instant_order.warehouse_polygon
+   WHERE is_beta = 0
+ ),
+ base AS (
+   SELECT l.country_code, p.wh_code, l.date_, l.order_nr, l.sku
+   FROM (
+     SELECT *, ST_GEOGPOINT(lng,lat) as geo
+     FROM order_lat_long
+   ) l
+   JOIN (
+     SELECT wh_code, polygon, ST_GEOGFROMTEXT(polygon) geo
+     FROM polygon_ds
+   ) p ON ST_WITHIN(l.geo, p.geo)
+ ),
+ category_mapping AS (
+   SELECT LOWER(country_code) as country_code, sku, INITCAP(REPLACE(category, "_", " ")) as category
+   FROM           biinstnt.minutes.minutes_commercial_category_mapping
+   WHERE INITCAP(REPLACE(category, "_", " ")) IN ("Fruit & Vegetables")
+   GROUP BY 1,2,3
+ ),
+ cat_order_base AS (
+   SELECT country_code, category, wh_code, date_, EXTRACT(DAYOFWEEK FROM date_) AS dow, cat_country_orders as cc_orders,
+ COUNT(DISTINCT order_nr) AS cat_ds_orders
+FROM (SELECT a.country_code,scm.category,a.wh_code,a.date_,a.order_nr,
+   COUNT(DISTINCT a.order_nr) OVER (PARTITION BY a.country_code, scm.category, a.date_) AS cat_country_orders
+ FROM base a
+ JOIN category_mapping scm ON scm.sku = a.sku AND a.country_code = scm.country_code)
+GROUP BY ALL
+ ),
+wt_avail_base AS (SELECT country_code, wh_code, category, date_, country_cat_wt_avail,
+ROUND(SUM(wt_avail * sw) / SUM(sw), 4) AS ds_wt_avail,
+ FROM (SELECT a.country_code, a.wh_code, a.sku, category, date_, wt_avail, sw,
+     ROUND(SUM(wt_avail * sw) OVER (PARTITION BY a.country_code, category, date_) /
+       NULLIF(SUM(sw) OVER (PARTITION BY a.country_code, category, date_), 0), 4) AS country_cat_wt_avail
+   FROM           binimdwh.modelling.fnv_forecast_base a
+   LEFT JOIN (
+     SELECT wh_code, sku, weights AS sw
+     FROM           biinstnt.minutes.store_sku_weights
+   ) b ON a.wh_code = b.wh_code AND a.sku = b.sku
+   WHERE date_ BETWEEN CURRENT_DATE("Asia/Dubai") - 60 AND CURRENT_DATE("Asia/Dubai") - 1
+ )
+ GROUP BY 1,2,3,4, 5
+),
+ filter_base2 AS (
+  SELECT country_code, wh_code, category, dow, SUM(corr_cc_orders) as t_cc_carts, ROUND(AVG(corr_cc_orders),0) as a_cc_carts,
+  SUM(corr_ds_orders) as t_ds_carts, ROUND(AVG(corr_ds_orders),0) as a_ds_carts,
+   FROM (
+     SELECT country_code, category, date_, wh_code, dow,  cc_orders,cat_ds_orders as cd_orders, cc_wt_avail, ds_wt_avail, ROUND(cc_orders * (1 + 0.85 * (1 - cc_wt_avail)),0) as corr_cc_orders,
+     ROUND(cat_ds_orders * (1 + 0.85 * (1 - ds_wt_avail)),0) as corr_ds_orders,
+     RANK() OVER(PARTITION BY country_code, category, dow, wh_code ORDER BY date_ DESC) as rnk_
+     FROM (
+       SELECT a.*, b.country_cat_wt_avail as cc_wt_avail, ds_wt_avail
+       FROM cat_order_base a
+       LEFT JOIN wt_avail_base b ON a.date_ = b.date_ AND a.category = b.category AND a.country_code = b.country_code and a.wh_code = b.wh_code
+     )
+     WHERE date_ not in ('2025-03-01','2025-03-02','2025-02-28','2025-03-03','2025-03-04','2025-03-05','2025-03-06','2025-03-07','2025-03-08','2025-03-09','2025-03-29','2025-03-30','2025-03-31')
+   )
+   WHERE rnk_ < 5
+   GROUP BY 1,2,3,4
+ ),
+ prep_base AS (
+   SELECT a.country_code, a.category,a.wh_code, a.dow as fdow, t_cc_carts, a_cc_carts,t_ds_carts,a_ds_carts, b.dow
+   FROM (
+     SELECT *, 1 as flag
+     FROM filter_base2
+   ) a
+   JOIN (
+     SELECT 1 as flag, dow
+     FROM (
+       SELECT * FROM UNNEST([1,2,3,4,5,6,7]) AS dow
+     )
+   ) b ON a.flag = b.flag
+ ),
+ calc_base AS (
+   SELECT a.country_code, a.category, a.fdow, a.dow, a.wh_code,
+   a.t_ds_carts as ft_ds,
+    b.t_ds_carts as dt_ds,
+   a.t_cc_carts as ft_cc,
+    b.t_cc_carts as dt_cc,
+     a.a_ds_carts as fa_ds,
+     b.a_ds_carts as da_ds,
+     a.a_cc_carts as fa_cc,
+     b.a_cc_carts as da_cc,
+     ROUND(SAFE_DIVIDE(a.t_ds_carts, b.t_ds_carts),2) as tf_ds,
+     ROUND(SAFE_DIVIDE(a.a_ds_carts, b.a_ds_carts),2) as af_ds,    
+     ROUND(SAFE_DIVIDE(a.t_cc_carts, b.t_cc_carts),2) as tf_cc,
+     ROUND(SAFE_DIVIDE(a.a_cc_carts, b.a_cc_carts),2) as af_cc
+   FROM prep_base a
+   LEFT JOIN filter_base2 b ON a.country_code = b.country_code AND a.category = b.category AND a.dow = b.dow and a.wh_code = b.wh_code
+ )
+ SELECT *, (CURRENT_TIMESTAMP + INTERVAL 4 HOUR) as updated_at
+ FROM calc_base
+)
+'''
+
+dag_id = 'fnv_forecast'
+schedule_interval = '35 1 * * *'
+## Extrapolation Equations
+[[sheetstobq]]
+dag_id = 'fnv_forecast'
+task_id = 'fnv_equations'
+destination_table = '             binimdwh.modelling.fnv_model_equations'
+sheet_url = 'https://docs.google.com/spreadsheets/d/1geNNh59zfcZ-o_nZoqF4SZd9OnW1EGIkAzr6f-gesoA'
+tabname = 'Params | Equations'
+schema=[{type = 'string', name = 'country_code'},{type = 'string', name = 'sku_tier'},{type = 'string', name = 'x6'},{type = 'string', name = 'x5'},{type = 'string', name = 'x4'},{type = 'string', name = 'x3'},{type = 'string', name = 'x2'},{type = 'string', name = 'x'},{type = 'string', name = 'a'}]
+## Capping Thresholds
+[[sheetstobq]]
+dag_id = 'fnv_forecast'
+task_id = 'fnv_cappings'
+destination_table = '             binimdwh.modelling.fnv_model_cappings'
+sheet_url = 'https://docs.google.com/spreadsheets/d/1geNNh59zfcZ-o_nZoqF4SZd9OnW1EGIkAzr6f-gesoA'
+tabname = 'Params | Capping Controls'
+schema=[{type = 'string', name = 'country_code'}, {type = 'string', name = 'sku_tier'}, {type = 'string', name = 'ub'}, {type = 'string', name = 'lb'}]
+## Store x SKU Growth Factor
+[[sheetstobq]]
+dag_id = 'fnv_forecast'
+task_id = 'fnv_growth_dsxsku'
+destination_table = '             binimdwh.modelling.fnv_model_growth_factor_dsxsku'
+sheet_url = 'https://docs.google.com/spreadsheets/d/1geNNh59zfcZ-o_nZoqF4SZd9OnW1EGIkAzr6f-gesoA'
+tabname = 'Params | SKUxStore'
+schema=[{type = 'string', name = 'wh_code'}, {type = 'string', name = 'sku'}, {type = 'string', name = 'start_date'}, {type = 'string', name = 'end_date'}, {type = 'string', name = 'growth_factor'}]
+## Store x Category Growth Factor
+[[sheetstobq]]
+dag_id = 'fnv_forecast'
+task_id = 'fnv_growth_dsxcategory'
+destination_table = '             binimdwh.modelling.fnv_model_growth_factor_dsxcategory'
+sheet_url = 'https://docs.google.com/spreadsheets/d/1geNNh59zfcZ-o_nZoqF4SZd9OnW1EGIkAzr6f-gesoA'
+tabname = 'Params | CategoryxStore'
+schema=[{type = 'string', name = 'wh_code'}, {type = 'string', name = 'category'}, {type = 'string', name = 'start_date'}, {type = 'string', name = 'end_date'}, {type = 'string', name = 'growth_factor'}]
+## Demand Mapping Store x SKU
+[[sheetstobq]]
+dag_id = 'fnv_forecast'
+task_id = 'fnv_demand_mapping'
+destination_table = '             binimdwh.modelling.fnv_model_demand_mapping'
+sheet_url = 'https://docs.google.com/spreadsheets/d/1geNNh59zfcZ-o_nZoqF4SZd9OnW1EGIkAzr6f-gesoA'
+tabname = 'Params|Demand Mapping'
+schema=[{type = 'string', name = 'wh_code'}, {type = 'string', name = 'parent_sku'},  {type = 'string', name = 'child_sku'},{type = 'string', name = 'demand_shift_perc'}, {type = 'string', name = 'start_date'}, {type = 'string', name = 'end_date'}]
+# Working Steps
+[[bqsql]]
+dag_id = 'fnv_forecast'
+task_id = 'fnv_model_working_steps'
+depends = ['fnv_cappings','fnv_equations']
+sql = '''
+INSERT INTO              binimdwh.modelling.fnv_model_working_steps
+(country_code, category, sub_category, wh_code, sku, sku_tier, fdate_, date_, tf, corr_rnk, wt, units_sold, units_liq, wt_avail, init_fps, init_asp, nor_fps, lb_nor, ub_nor, corr_nor_fps, bau_asp, promo_asp, future_asp, is_elastic, dc, pc, elastic_factor, els_fps, lb_els, ub_els, corr_els_fps, updated_at)
+SELECT * FROM (
+ WITH base AS (
+   SELECT a.country_code, wh_code, date_, EXTRACT(DAYOFWEEK FROM date_) as dow, CASE WHEN EXTRACT(DAYOFWEEK FROM date_) IN (1,7) THEN 'weekend' ELSE 'weekday' END as week_, sku, a.sku_tier,
+   CAST(COALESCE(ub,0.75) * 100 AS INT64) as ub, CAST(COALESCE(lb,0.25) * 100 AS INT64) as lb, category, sub_category, units_sold, units_liq, COALESCE(asp,0) as asp, COALESCE(liq_asp,0) as liq_asp, wt_avail, x6, x5, x4, x3, x2, x1,con, 1 as flag
+   FROM              binimdwh.modelling.fnv_forecast_base a
+   LEFT JOIN (
+     SELECT country_code, sku_tier, SAFE_CAST(ub AS FLOAT64) as ub, SAFE_CAST(lb AS FLOAT64) as lb
+     FROM              binimdwh.modelling.fnv_model_cappings
+   ) b ON a.sku_tier = b.sku_tier AND a.country_code = b.country_code
+   LEFT JOIN (
+     SELECT country_code, sku_tier, SAFE_CAST(x6 AS FLOAT64) as x6, SAFE_CAST(x5 AS FLOAT64) as x5, SAFE_CAST(x4 AS FLOAT64) as x4, SAFE_CAST(x3 AS FLOAT64) as x3, SAFE_CAST(x2 AS FLOAT64) as x2, SAFE_CAST(x AS FLOAT64) as x1, SAFE_CAST(a AS FLOAT64) as con
+     FROM              binimdwh.modelling.fnv_model_equations
+   ) c ON a.sku_tier = c.sku_tier AND a.country_code = c.country_code
+   WHERE date_ NOT BETWEEN DATE("2024-11-01") AND DATE("2024-11-30")
+   AND date_ not in ('2025-05-11','2025-05-10','2025-06-07','2025-06-06','2025-06-05') 
+   AND a.country_code IN ("sa","ae")
+   AND a.wt_avail > 0
+ ),
+ filter_base AS (
+   SELECT * FROM (
+     SELECT *, RANK() OVER(PARTITION BY wh_code, sku ORDER BY date_ DESC) as rnk_
+     FROM base
+   )
+   WHERE rnk_ < 8
+ ),
+ avail_extrapolation_base AS (
+   SELECT a.*, CASE WHEN (wt_avail > 0.97) THEN 0 WHEN (wt_avail > 0.95) THEN 0.02 WHEN (init_fc < 0) THEN 0.01 ELSE init_fc END as fc, b.fdate_, b.fdow
+   FROM (
+     SELECT *, (x6 * POW(wt_avail,6)) + (x5 * POW(wt_avail,5)) + (x4 * POW(wt_avail,4)) + (x3 * POW(wt_avail,3)) + (x2 * POW(wt_avail,2)) + (x1 * wt_avail) + con as init_fc
+     FROM filter_base
+   ) a
+   JOIN (
+     SELECT 1 as flag, fdate_, EXTRACT(DAYOFWEEK FROM fdate_) as fdow
+     FROM (
+       SELECT * FROM UNNEST(GENERATE_DATE_ARRAY(CURRENT_DATE("Asia/Dubai") + 1, CURRENT_DATE("Asia/Dubai") + 2, INTERVAL 1 DAY)) as fdate_
+     )
+   ) b ON a.flag = b.flag
+ ),
+ dow_norm_base AS (
+   SELECT country_code, category, wh_code, fdow, dow,
+   CASE WHEN tf >= 2.5 THEN 2.5
+   ELSE tf end as tf
+   FROM(
+   SELECT country_code, category, wh_code, fdow, dow, COALESCE(tf_ds,tf_cc) as tf
+   FROM              binimdwh.modelling.fnv_dow_normalization
+   WHERE country_code IN ("sa","ae")
+   AND category = "Fruit & Vegetables"
+   GROUP BY 1,2,3,4,5,6)
+ ),
+ elasticity_base AS (
+   WITH sa as (
+     SELECT 'sa' as country_code, wh_code, sku, weekday as dow, demand_change as dc, price_change as pc, CASE WHEN demand_change * price_change < 0 THEN 1 ELSE 0 END as is_elastic
+     FROM              binimprc.pricing_uploader.KSA_elasticity_base1_wh
+     GROUP BY 1,2,3,4,5,6
+   ),
+   ae AS (
+     SELECT 'ae' as country_code, wh_code, sku, weekday as dow, demand_change as dc, price_change as pc, CASE WHEN demand_change * price_change < 0 THEN 1 ELSE 0 END as is_elastic
+     FROM              binimprc.pricing_uploader.uae_elasticity_base1_wh
+     GROUP BY 1,2,3,4,5,6
+   )
+   SELECT * FROM ae
+   UNION ALL
+   SELECT * FROM sa
+ ),
+ bau_price_base AS (
+   SELECT wh_code, sku, final_price as bau_asp
+   FROM              binimprc.pricing_uploader.as_base_price_w_o
+ ),
+ promo_price_base AS (
+   WITH sa AS (
+     SELECT 'sa' as country_code, wh_code, sku, dt as date_, COALESCE(sale_promo_price,promo_price) as promo_asp
+     FROM              binimprc.pricing_uploader.sa_promo_price_w_o_wh_level
+   ),
+   ae AS (
+     SELECT 'ae' as country_code, wh_code, sku, dt as date_, COALESCE(sale_promo_price,promo_price) as promo_asp
+     FROM              binimprc.pricing_uploader.ae_promo_price_w_o_wh_level
+   )
+   SELECT * FROM ae
+   UNION ALL
+   SELECT * FROM sa
+ ),
+ act_conversion_base AS (
+   WITH sa AS (
+     SELECT 'sa' as country_code, wh_code, sku, checkout_conversion_average as conv
+     FROM              binimprc.pricing.sku_conversion_overall_dashboard_sa
+   ),
+   ae AS (
+     SELECT 'ae' as country_code, wh_code, sku, checkout_conversion_average as conv
+     FROM              binimprc.pricing.sku_conversion_overall_dashboard
+   )
+   SELECT * FROM ae
+   UNION ALL
+   SELECT * FROM sa
+  ),
+ prep_base AS (
+   SELECT ab.country_code, ab.category, ab.sub_category, ab.wh_code, ab.sku, sku_tier, ab.fdow, ab.fdate_, ab.date_, ab.dow, tf, units_sold, units_liq, asp, liq_asp, wt_avail, fc, CASE WHEN ab.fdow = ab.dow THEN rnk_ ELSE rnk_ + 30 END as rnk_, ub, lb,
+   ROUND((units_sold - (units_liq*1)) * (1 + fc),2) as init_fps, ROUND((units_sold - (units_liq*1)) * (1 + fc) * tf,2) as nor_fps, ROUND(COALESCE(SAFE_DIVIDE((units_sold * asp) - (units_liq * liq_asp),(units_sold - units_liq)),0),2) as init_asp, ppb.promo_asp, bpb.bau_asp,
+   COALESCE(COALESCE(promo_asp, bau_asp),asp) as future_asp, COALESCE(is_elastic,0) as is_elastic, COALESCE(dc,0) as dc, COALESCE(pc,0) as pc, COALESCE(conv,0.8) as conv
+   FROM avail_extrapolation_base ab
+   LEFT JOIN dow_norm_base nb ON ab.category = nb.category AND ab.dow = nb.dow AND ab.fdow = nb.fdow AND ab.country_code = nb.country_code AND ab.wh_code = nb.wh_code
+   LEFT JOIN promo_price_base ppb ON ab.sku = ppb.sku AND ab.fdate_ = ppb.date_ AND ab.country_code = ppb.country_code AND ab.wh_code = ppb.wh_code
+   LEFT JOIN bau_price_base bpb ON ab.sku = bpb.sku AND ab.wh_code = bpb.wh_code
+   LEFT JOIN elasticity_base eb ON ab.wh_code = eb.wh_code AND ab.sku = eb.sku AND ab.week_ = eb.dow AND ab.country_code = eb.country_code
+   LEFT JOIN act_conversion_base cb ON ab.sku = cb.sku AND ab.wh_code = cb.wh_code AND cb.country_code = ab.country_code
+ ),
+ calc_base AS (
+   SELECT *, CASE WHEN is_elastic = 0 THEN nor_fps ELSE ROUND(elastic_factor * nor_fps,2) END as els_fps
+   FROM (
+     SELECT *, 1 + CASE WHEN init_ef < -0.4 THEN -0.4 WHEN init_ef > 0.4 THEN 0.4 ELSE init_ef END as elastic_factor
+     FROM (
+       SELECT *, CASE WHEN r1 * r2 < 0 THEN r1 * r2 * (2 - GREATEST(conv,0.8)) ELSE r1 * r2 * GREATEST(conv,0.8) END as init_ef
+       FROM (
+         SELECT *, -1 * (1- COALESCE(SAFE_DIVIDE(future_asp,init_asp),1)) as r1, COALESCE(SAFE_DIVIDE(dc,pc),0) as r2
+         FROM prep_base
+       )
+     )
+   )
+ ),
+ capping_base AS (
+   SELECT DISTINCT wh_code, sku, fdate_, nor_fps_perc[OFFSET(ub)] as ub_nor, nor_fps_perc[OFFSET(lb)] as lb_nor, els_fps_perc[OFFSET(ub)] as ub_els, els_fps_perc[OFFSET(lb)] as lb_els
+   FROM (
+     SELECT wh_code, sku, fdate_, ub, lb, APPROX_QUANTILES(nor_fps, 100) as nor_fps_perc, APPROX_QUANTILES(els_fps, 100) as els_fps_perc, 
+     FROM calc_base
+     GROUP BY 1,2,3,4,5
+   )
+ ),
+ capped_base AS (
+   SELECT a.*, lb_nor, ub_nor, lb_els, ub_els, CASE WHEN nor_fps < lb_nor THEN lb_nor WHEN nor_fps > ub_nor THEN ub_nor ELSE nor_fps END as corr_nor_fps, CASE WHEN els_fps < lb_els THEN lb_els WHEN els_fps > ub_els THEN ub_els ELSE els_fps END as corr_els_fps, ROUND((MAX(corr_rnk) OVER(PARTITION BY a.wh_code, a.sku, fdow) - corr_rnk + 1) / SUM(corr_rnk) OVER(PARTITION BY a.wh_code, a.sku, fdow),4) as wt
+   FROM (
+     SELECT *, RANK() OVER(PARTITION BY wh_code, sku, fdow ORDER BY rnk_) as corr_rnk
+     FROM  calc_base
+   ) a
+   LEFT JOIN capping_base b ON a.wh_code = b.wh_code AND a.sku = b.sku AND a.fdate_ = b.fdate_
+ )
+  SELECT country_code, category, sub_category, wh_code, sku, sku_tier, fdate_, date_, tf, corr_rnk, wt, units_sold, units_liq, wt_avail, init_fps, init_asp, nor_fps, lb_nor, ub_nor, corr_nor_fps, bau_asp, promo_asp, future_asp, is_elastic, dc, pc, elastic_factor, els_fps, lb_els, ub_els, corr_els_fps, (CURRENT_TIMESTAMP + INTERVAL 4 HOUR) as updated_at
+ FROM capped_base
+)
+'''
+# Final Forecast
+[[bqsql]]
+dag_id = 'fnv_forecast'
+task_id = 'fnv_model_forecast'
+depends = ['fnv_model_working_steps','fnv_growth_dsxsku','fnv_growth_dsxcategory','fnv_demand_mapping']
+sql = '''
+INSERT INTO              binimdwh.modelling.fnv_forecast_logs
+(country_code, category, sub_category, wh_code, sku, sku_tier, fdate_, wt_avail, is_elastic, asp, promo_asp, bau_asp, future_asp, init_nor_fps, elastic_factor, init_corr_fps, fps, updated_at)
+SELECT * FROM (
+   with base as (SELECT a.* FROM              binimdwh.modelling.fnv_model_working_steps a
+   JOIN (
+     SELECT wh_code, sku, fdate_, MAX(updated_at) as max_at
+     FROM              binimdwh.modelling.fnv_model_working_steps
+     GROUP BY 1,2,3
+   ) b ON a.wh_code = b.wh_code AND a.sku = b.sku AND a.fdate_ = b.fdate_ AND a.updated_at = b.max_at
+   WHERE a.fdate_ BETWEEN CURRENT_DATE("Asia/Dubai") + 1 AND CURRENT_DATE("Asia/Dubai") + 2
+ ),
+  calc_base AS (
+   SELECT country_code, wh_code, sku, sku_tier, category, sub_category, fdate_, ROUND(AVG(promo_asp),2) as promo_asp, ROUND(AVG(bau_asp),2) as bau_asp, ROUND(AVG(future_asp),2) as future_asp, CAST(ROUND(AVG(is_elastic),0) AS INT64) as is_elastic, ROUND(SAFE_DIVIDE(SUM((units_sold - units_liq) * init_asp * wt), SUM((units_sold - units_liq) * wt)),2) as asp, ROUND(SUM(elastic_factor * wt),4) as elastic_factor, ROUND(SUM(wt_avail * wt),4) as wt_avail, ROUND(SUM(nor_fps * wt),2) as init_nor_fps, ROUND(SUM(corr_nor_fps * wt),2) as init_corr_fps, ROUND(SUM(corr_els_fps * wt),2) as fps
+   FROM base
+   GROUP BY 1,2,3,4,5,6,7
+ ),
+ dsxsku_growth_base AS (
+   WITH base AS (
+     SELECT wh_code, sku, SAFE_CAST(start_date AS date) as sdate_, SAFE_CAST(end_date AS date) as edate_, SAFE_CAST(growth_factor AS FLOAT64) as gf1, ROW_NUMBER() OVER(PARTITION BY wh_code, sku) as row_
+     FROM              binimdwh.modelling.fnv_model_growth_factor_dsxsku
+   ),
+   date_range AS (
+     SELECT row_, wh_code, sku, gf1, DATE_ADD(sdate_, INTERVAL n DAY) AS fdate_
+     FROM base,
+     UNNEST(GENERATE_ARRAY(0, DATE_DIFF(edate_, sdate_, DAY))) AS n
+   ),
+   output AS (
+     SELECT a.wh_code, a.sku, a.fdate_, gf1
+     FROM date_range a
+     JOIN (
+       SELECT sku, wh_code, fdate_, MAX(row_) as row_
+       FROM date_range
+       GROUP BY 1,2,3
+     ) b ON a.wh_code = b.wh_code AND a.sku = b.sku AND a.fdate_ = b.fdate_ AND a.row_ = b.row_
+   )
+   SELECT sku, wh_code, fdate_, gf1
+   FROM output
+ ),
+ catxsku_growth_base AS (
+   WITH base AS (
+     SELECT LTRIM(RTRIM(wh_code)) as wh_code, LTRIM(RTRIM(category)) as category, SAFE_CAST(start_date AS date) as sdate_, SAFE_CAST(end_date AS date) as edate_, SAFE_CAST(growth_factor AS FLOAT64) as gf1, ROW_NUMBER() OVER(PARTITION BY wh_code, category) as row_
+     FROM              binimdwh.modelling.fnv_model_growth_factor_dsxcategory
+   ),
+   date_range AS (
+     SELECT row_, wh_code, category, gf1, DATE_ADD(sdate_, INTERVAL n DAY) AS fdate_
+     FROM base,
+     UNNEST(GENERATE_ARRAY(0, DATE_DIFF(edate_, sdate_, DAY))) AS n
+   ),
+   output AS (
+     SELECT a.wh_code, a.category, a.fdate_, gf1
+     FROM date_range a
+     JOIN (
+       SELECT category, wh_code, fdate_, MAX(row_) as row_
+       FROM date_range
+       GROUP BY 1,2,3
+     ) b ON a.wh_code = b.wh_code AND a.category = b.category AND a.fdate_ = b.fdate_ AND a.row_ = b.row_
+   )
+   SELECT category, wh_code, fdate_, gf1 as gf2
+   FROM output
+ ),
+  calc2 AS (
+   SELECT a.*, COALESCE(gf1,1) as gf1, COALESCE(gf2,1) as gf2
+   FROM calc_base a
+   LEFT JOIN dsxsku_growth_base b ON a.wh_code = b.wh_code AND a.sku = b.sku AND a.fdate_ = b.fdate_
+   LEFT JOIN catxsku_growth_base c ON a.wh_code = c.wh_code AND a.category = c.category AND a.fdate_ = c.fdate_
+ ),
+ intit_fps as (SELECT country_code, category, sub_category, wh_code, sku, sku_tier, fdate_, wt_avail, is_elastic, asp, promo_asp, bau_asp, future_asp, init_nor_fps, elastic_factor, init_corr_fps, ROUND(fps * gf1 * gf2,2) as fps
+ FROM calc2),
+ demand_mapping as
+   (WITH base AS (
+     SELECT row_, wh_code, parent_sku, child_sku, demand_shift_perc, DATE_ADD(sdate_, INTERVAL n DAY) AS fdate_
+     FROM (
+       SELECT wh_code, parent_sku, child_sku, SAFE_CAST(start_date AS date) as sdate_, SAFE_CAST(end_date AS date) as edate_, SAFE_CAST(demand_shift_perc AS FLOAT64) as demand_shift_perc, ROW_NUMBER() OVER(PARTITION BY wh_code, parent_sku,child_sku) as row_
+       FROM              binimdwh.modelling.fnv_model_demand_mapping
+     ),
+     UNNEST(GENERATE_ARRAY(0, DATE_DIFF(edate_, sdate_, DAY))) AS n 
+   )
+   SELECT a.wh_code, a.parent_sku, a.child_sku, a.fdate_, demand_shift_perc
+   FROM base a
+   JOIN (
+     SELECT wh_code, parent_sku, child_sku, fdate_, MAX(row_) as row_
+     FROM base
+     GROUP BY 1,2,3,4
+   ) b ON a.wh_code = b.wh_code AND a.parent_sku = b.parent_sku AND a.child_sku = b.child_sku AND a.fdate_ = b.fdate_ AND a.row_ = b.row_
+   WHERE a.fdate_ BETWEEN CURRENT_DATE + 1 and CURRENT_DATE + 2),
+    fps_add_base AS (
+     SELECT wh_code,parent_sku, sku, fdate_, SUM(fps_to_add) as add_fps, 1 as add_flag
+     FROM (
+       SELECT wh_code,parent_sku, child_sku as sku, fdate_, demand_shift_perc, fps, ROUND(fps * demand_shift_perc,2) as fps_to_add
+       FROM (
+         SELECT a.*, b.parent_sku, b.child_sku, demand_shift_perc
+         FROM intit_fps a
+         JOIN demand_mapping b ON a.wh_code = b.wh_code and a.fdate_ = b.fdate_ and a.sku = b.parent_sku
+       )
+     )
+     GROUP BY 1,2,3,4
+   ),
+   fps_cut_base AS (
+     SELECT wh_code, sku, fdate_, SUM(fps_to_cut) as cut_fps,1 as cut_flag
+     FROM (
+       SELECT wh_code, parent_sku as sku, fdate_, demand_shift_perc, fps,(fps - ROUND(fps * demand_shift_perc,2)) as fps_to_cut
+       FROM (
+         SELECT a.*, b.parent_sku, b.child_sku, demand_shift_perc
+         FROM intit_fps a
+         JOIN demand_mapping b ON a.wh_code = b.wh_code and a.fdate_ = b.fdate_ and a.sku = b.parent_sku
+       )
+     )
+     GROUP BY 1,2,3
+   ),
+ replace_base as (
+   WITH replace1 as (select country_code, category, sub_category, a.wh_code, a.sku, sku_tier, a.fdate_, wt_avail, is_elastic, asp, promo_asp, bau_asp, future_asp, init_nor_fps, elastic_factor, init_corr_fps, Case when cut_flag = 1 then cut_fps else fps end as fps
+  from intit_fps a
+ LEFT JOIN fps_cut_base b on a.fdate_ = b.fdate_ and a.wh_code = b.wh_code and a.sku = b.sku),
+  replace2 as (select country_code, category, sub_category, a.wh_code, b.sku as sku, sku_tier, a.fdate_, wt_avail, is_elastic, asp, promo_asp, bau_asp, future_asp, init_nor_fps, elastic_factor, init_corr_fps, Case when add_flag = 1 then add_fps else fps end as fps
+  from intit_fps a
+JOIN fps_add_base b on a.fdate_ = b.fdate_ and a.wh_code = b.wh_code and a.sku = b.parent_sku)
+SELECT * from replace1
+UNION ALL
+SELECT * from replace2)
+select country_code, category, sub_category, wh_code, sku as sku, sku_tier, fdate_, wt_avail, is_elastic, asp, promo_asp, bau_asp, future_asp, init_nor_fps, elastic_factor, init_corr_fps, fps, CURRENT_TIMESTAMP + INTERVAL 4 HOUR as updated_at
+from replace_base
+)
