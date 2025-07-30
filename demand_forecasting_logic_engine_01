@@ -1,0 +1,282 @@
+dag_id = 'forecast_data_prep'
+schedule_interval = '35 23 * * *'
+dag_id = 'forecast_data_prep'
+task_id = 'sales_availability'
+sql = '''
+CREATE OR REPLACE TABLE       binimdwh.modelling.forecast_base
+PARTITION BY date_
+CLUSTER BY country_code, wh_code, sku AS (
+ WITH assortment_master AS (
+   SELECT country_code, wh_code, date_, hour_, sku, stock_net, is_available
+   FROM (
+     SELECT *, ROW_NUMBER() OVER(PARTITION BY sku, wh_code, hour_ ORDER BY date_ DESC) AS date_rn
+     FROM (
+       SELECT country_code, wh_code, CASE WHEN country_code IN ("ae") THEN DATE(recorded_at) ELSE DATE(recorded_at - INTERVAL 1 HOUR) END as date_, CASE WHEN country_code IN ("ae") THEN EXTRACT(hour FROM recorded_at) ELSE EXTRACT(hour FROM recorded_at - INTERVAL 1 HOUR) END as hour_, zsku as sku, stock_net, CASE WHEN stock_net > 0 THEN 1 ELSE 0 END as is_available
+       FROM       biinstnt.minutes.hourly_stock_snapshots
+       WHERE date_ > CURRENT_DATE("Asia/Dubai") - 121
+       AND country_code IN ("ae","sa")
+     )
+     WHERE date_ BETWEEN CURRENT_DATE("Asia/Dubai") - 120 AND CURRENT_DATE("Asia/Dubai") - 1
+     AND date_ NOT BETWEEN '2024-11-01' and '2024-11-30'
+   )
+   WHERE date_rn <= 90
+ ),
+  wh_polygon_mapping AS (
+   WITH order_base AS (
+     SELECT REGEXP_EXTRACT(address_key, r'^[^-]*') as address_code, SAFE_CAST(REGEXP_EXTRACT(address_key,"-(.+)") as int64) as address_version, order_nr
+     FROM       dwh.instant_instant_order.sales_order so
+     WHERE DATE(so.created_at + INTERVAL 4 HOUR) BETWEEN CURRENT_DATE("Asia/Dubai") - 125 AND CURRENT_DATE("Asia/Dubai") - 1
+     AND so.status_code_order = "delivered"
+     GROUP BY 1,2,3
+   ),
+   lat_long AS (
+     SELECT order_nr, lat, lng
+     FROM order_base sb
+     JOIN       dwh.customerexposed_customer_hashed.address_history ca ON sb.address_code = ca.address_code AND sb.address_version = ca.v_customer_address
+     GROUP BY 1,2,3
+   ),
+   polygon_ds AS (
+     SELECT wh_code, polygon
+     FROM       dwh.instant_instant_order.warehouse_polygon
+     WHERE is_beta = 0
+   ),
+   base AS (
+     SELECT p.wh_code, l.order_nr
+     FROM (
+       SELECT *, ST_GEOGPOINT(lng,lat) as geo
+       FROM lat_long
+     ) l
+     JOIN (
+       SELECT wh_code, polygon, ST_GEOGFROMTEXT(polygon) geo
+       FROM polygon_ds
+     ) p ON ST_WITHIN(l.geo, p.geo)
+   )
+   SELECT wh_code, order_nr
+   FROM base
+ ),
+  sales_master AS (
+   SELECT *, CASE WHEN promo_code LIKE ("%liq%") THEN 1 ELSE 0 END is_liq, CASE WHEN is_vendor_funded = 1 AND promo_support > 0 THEN 1 ELSE 0 END as is_promo
+   FROM (
+     SELECT a.*, COALESCE(is_vendor_funded,0) as is_vendor_funded
+     FROM (
+       SELECT so.country_code, pwm.wh_code, CASE WHEN so.country_code IN ("ae") THEN DATE(so.created_at + INTERVAL 4 HOUR) ELSE DATE(so.created_at + INTERVAL 3 HOUR) END as date_, CASE WHEN so.country_code IN ("ae") THEN EXTRACT(hour FROM so.created_at + INTERVAL 4 HOUR) ELSE EXTRACT(hour FROM so.created_at + INTERVAL 3 HOUR) END as hour_, so.order_nr, soi.sku, item_nr, soi.price, LOWER(JSON_EXTRACT_SCALAR(soi.misc, '$.promo_code')) as promo_code, CAST(JSON_EXTRACT_SCALAR(soi.misc, '$.promo_support') as FLOAT64) as promo_support
+       FROM       dwh.instant_instant_order.sales_order so
+       JOIN       dwh.instant_instant_order.sales_order_item soi ON soi.id_sales_order = so.id_sales_order
+       JOIN wh_polygon_mapping pwm ON pwm.order_nr = so.order_nr
+       WHERE so.country_code IN ("ae","sa")
+       AND DATE(so.created_at + INTERVAL 4 HOUR) BETWEEN CURRENT_DATE("Asia/Dubai") - 125 AND CURRENT_DATE("Asia/Dubai") - 1
+       AND so.status_code_order = "delivered" AND soi.cancel_reason_code IS NULL
+       GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+     ) a
+     LEFT JOIN (
+       SELECT LOWER(promo_code) as promo_code, is_active, country_code, is_vendor_funded
+       FROM       dwh.instant_instant_offer.promo_burn
+     ) prbn ON a.country_code = prbn.country_code AND a.promo_code = prbn.promo_code
+   )
+ ),
+ hour_weight_base AS (
+   SELECT wh_code, hour_, ROUND(orders / SUM(orders) OVER(PARTITION BY wh_code), 5) as hw
+   FROM (
+     SELECT wh_code, hour_, COUNT(DISTINCT order_nr) as orders
+     FROM sales_master
+     WHERE date_ BETWEEN CURRENT_DATE("Asia/Dubai") - 30 AND CURRENT_DATE("Asia/Dubai") - 1
+     GROUP BY 1, 2
+   )
+ ),
+ base AS (
+   SELECT a.country_code, a.wh_code, a.date_, a.sku, ROUND(SAFE_DIVIDE(SUM(is_available * hw),SUM(hw)), 4) as wt_o_avail,
+   ROUND(SAFE_DIVIDE(SUM(CASE WHEN a.hour_ BETWEEN 6 AND 23 THEN is_available * hw END),SUM(CASE WHEN a.hour_ BETWEEN 6 AND 23 THEN hw END)),4) as wt_b_avail,
+   ROUND(SAFE_DIVIDE(SUM(CASE WHEN a.hour_ BETWEEN 6 AND 20 THEN is_available * hw END),SUM(CASE WHEN a.hour_ BETWEEN 6 AND 20 THEN hw END)),4) as wt_e_avail
+   FROM assortment_master a
+   LEFT JOIN hour_weight_base b ON a.wh_code = b.wh_code AND a.hour_ = b.hour_
+   GROUP BY 1, 2, 3, 4
+ ),
+ merged_base AS (
+   SELECT a.*, COALESCE(b.units_sold,0) as units_sold, COALESCE(b.sp,0) as sp, COALESCE(b.units_liq,0) as units_liq, COALESCE(b.liq_sp,0) as liq_sp, COALESCE(b.units_promo,0) as units_promo, COALESCE(b.promo_sp,0) as promo_sp, COALESCE(units_event,0) as units_event, COALESCE(event_sp,0) as event_sp
+   FROM base a
+   LEFT JOIN (
+     SELECT wh_code, date_, sku, COUNT(DISTINCT order_nr) as orders, SUM(units_sold) as units_sold, SUM(units_liq) as units_liq, SUM(units_promo) as units_promo, SUM(units_event) as units_event, SUM(sp) as sp, SUM(liq_sp) as liq_sp, SUM(promo_sp) as promo_sp, SUM(event_sp) as event_sp
+     FROM (
+       SELECT wh_code, date_, sku, order_nr, SUM(is_liq) as units_liq, SUM(is_promo) as units_promo, COUNT(DISTINCT item_nr) as units_sold, SUM(1 * price) as sp, SUM(CASE WHEN is_liq = 1 THEN price ELSE 0 END) as liq_sp, SUM(CASE WHEN is_promo = 1 THEN price ELSE 0 END) as promo_sp, SUM(GREATEST(is_promo, is_liq)) as units_event, SUM(CASE WHEN GREATEST(is_promo, is_liq) = 1 THEN price ELSE 0 END) as event_sp
+       FROM sales_master
+       GROUP BY 1, 2, 3, 4
+     )
+     GROUP BY 1, 2, 3
+   ) b ON a.wh_code = b.wh_code AND a.sku = b.sku AND a.date_ = b.date_
+ )
+ SELECT a.date_, country_code, a.wh_code, sku, wt_o_avail, wt_b_avail, wt_e_avail, units_sold, ROUND(SAFE_DIVIDE(sp,units_sold),2) as asp, units_liq, ROUND(SAFE_DIVIDE(liq_sp,units_liq),2) as liq_asp, units_promo, ROUND(SAFE_DIVIDE(promo_sp,units_promo),2) as promo_asp, units_event, ROUND(SAFE_DIVIDE(event_sp,units_event),2) as event_asp, COALESCE(tot_orders,0) as tot_orders, CURRENT_TIMESTAMP + INTERVAL 4 HOUR as updated_at
+ FROM merged_base a
+ LEFT JOIN (
+   SELECT wh_code, date_, COUNT(DISTINCT order_nr) as tot_orders
+   FROM sales_master
+   GROUP BY 1,2
+ ) b ON a.wh_code = b.wh_code AND a.date_ = b.date_
+)
+'''
+[[dags]]
+dag_id = 'ds_model_base_prep_ae'
+schedule_interval = '25 20 * * *'
+[[bqsql]]
+dag_id = 'ds_model_base_prep_ae'
+task_id = 'base_data'
+sql = '''
+CREATE OR REPLACE TABLE       binimdwh.modelling.ds_model_base_data
+PARTITION BY date_
+CLUSTER BY category, country_code, wh_code AS (
+ WITH stock_master AS (
+   SELECT country_code, wh_code, date_, sku, ROUND(AVG(offer_price),2) as asp, SUM(is_available) as is_available, SUM(1) as tot_available
+   FROM (
+     SELECT country_code, wh_code, recorded_at, DATE(recorded_at) as date_, zsku as sku, stock_net, CASE WHEN stock_net > 0 THEN 1 ELSE 0 END as is_available, offer_price
+     FROM       biinstnt.minutes.hourly_stock_snapshots
+     WHERE date_ > "2023-12-31"
+     AND country_code IN ("ae")
+     AND id_partner = 9411
+   )
+   WHERE date_ BETWEEN "2024-01-01" AND CURRENT_DATE("Asia/Dubai") - 1
+   GROUP BY 1,2,3,4
+ ),
+  wh_polygon_mapping AS (
+   WITH order_base AS (
+     SELECT REGEXP_EXTRACT(address_key, r'^[^-]*') as address_code, SAFE_CAST(REGEXP_EXTRACT(address_key,"-(.+)") as int64) as address_version, order_nr
+     FROM       dwh.instant_instant_order.sales_order so
+     WHERE DATE(so.created_at + INTERVAL 4 HOUR) BETWEEN "2024-01-01" AND CURRENT_DATE("Asia/Dubai") - 1
+     AND so.status_code_order = "delivered"
+     AND so.country_code = "ae"
+     GROUP BY 1,2,3
+   ),
+   lat_long AS (
+     SELECT order_nr, lat, lng
+     FROM order_base sb
+     JOIN       dwh.customerexposed_customer_hashed.address_history ca ON sb.address_code = ca.address_code AND sb.address_version = ca.v_customer_address
+     GROUP BY 1,2,3
+   ),
+   polygon_ds AS (
+     SELECT wh_code, polygon
+     FROM       dwh.instant_instant_order.warehouse_polygon
+     WHERE is_beta = 0
+   ),
+   base AS (
+     SELECT p.wh_code, l.order_nr
+     FROM (
+       SELECT *, ST_GEOGPOINT(lng,lat) as geo
+       FROM lat_long
+     ) l
+     JOIN (
+       SELECT wh_code, polygon, ST_GEOGFROMTEXT(polygon) geo
+       FROM polygon_ds
+     ) p ON ST_WITHIN(l.geo, p.geo)
+   )
+   SELECT wh_code, order_nr
+   FROM base
+ ),
+  sales_master AS (
+   SELECT country_code, wh_code, date_, sku, COUNT(DISTINCT item_nr) as units_sold, ROUND(SAFE_DIVIDE(SUM(price), COUNT(DISTINCT item_nr)),2) as asp
+   FROM (
+     SELECT so.country_code, pwm.wh_code, CASE WHEN so.country_code IN ("ae") THEN DATE(so.created_at + INTERVAL 4 HOUR) ELSE DATE(so.created_at + INTERVAL 3 HOUR) END as date_, so.order_nr, soi.sku, item_nr, soi.price
+     FROM       dwh.instant_instant_order.sales_order so
+     JOIN       dwh.instant_instant_order.sales_order_item soi ON soi.id_sales_order = so.id_sales_order
+     JOIN wh_polygon_mapping pwm ON pwm.order_nr = so.order_nr
+     WHERE so.country_code IN ("ae")
+     AND DATE(so.created_at + INTERVAL 4 HOUR) BETWEEN "2024-01-01" AND CURRENT_DATE("Asia/Dubai") - 1
+     AND so.status_code_order = "delivered" AND soi.cancel_reason_code IS NULL
+     GROUP BY 1, 2, 3, 4, 5, 6, 7
+   )
+   GROUP BY 1,2,3,4
+ ),
+ base AS (
+   SELECT a.*,COALESCE(category, 'Not Defined') as category, COALESCE(b.units_sold,0) as units_sold, COALESCE(b.asp,a.asp) as avg_selling_price
+   FROM stock_master a
+   LEFT JOIN sales_master b ON a.wh_code = b.wh_code AND a.sku = b.sku AND a.date_ = b.date_
+   LEFT JOIN (
+     SELECT LOWER(country_code) as country_code, sku, INITCAP(REPLACE(category, "_", " ")) as category
+     FROM       biinstnt.minutes.minutes_commercial_category_mapping
+     GROUP BY 1,2,3
+   ) c ON a.sku = c.sku AND a.country_code = c.country_code
+ ) 
+ SELECT country_code, wh_code, sku, category, date_, is_available, tot_available, units_sold, avg_selling_price, CURRENT_TIMESTAMP + INTERVAL 4 HOUR as last_updated_at
+ FROM base
+)
+'''
+[[dags]]
+dag_id = 'ds_model_base_prep_sa'
+schedule_interval = '15 21 * * *'
+[[bqsql]]
+dag_id = 'ds_model_base_prep_sa'
+task_id = 'base_data'
+sql = '''
+CREATE OR REPLACE TABLE       binimdwh.modelling.ds_model_base_data_sa
+PARTITION BY date_
+CLUSTER BY category, country_code, wh_code AS (
+ WITH stock_master AS (
+   SELECT country_code, wh_code, date_, sku, ROUND(AVG(offer_price),2) as asp, SUM(is_available) as is_available, SUM(1) as tot_available
+   FROM (
+     SELECT country_code, wh_code, (recorded_at - INTERVAL 1 HOUR) as recorded_at, DATE(recorded_at - INTERVAL 3 HOUR) as date_, zsku as sku, stock_net, CASE WHEN stock_net > 0 THEN 1 ELSE 0 END as is_available, offer_price
+     FROM       biinstnt.minutes.hourly_stock_snapshots
+     WHERE date_ > "2023-12-31"
+     AND country_code IN ("sa")
+     AND id_partner = 9311
+   )
+   WHERE date_ BETWEEN "2024-01-01" AND CURRENT_DATE("Asia/Riyadh") - 1
+   GROUP BY 1,2,3,4
+ ),
+  wh_polygon_mapping AS (
+   WITH order_base AS (
+     SELECT REGEXP_EXTRACT(address_key, r'^[^-]*') as address_code, SAFE_CAST(REGEXP_EXTRACT(address_key,"-(.+)") as int64) as address_version, order_nr
+     FROM       dwh.instant_instant_order.sales_order so
+     WHERE DATE(so.created_at + INTERVAL 3 HOUR) BETWEEN "2024-01-01" AND CURRENT_DATE("Asia/Riyadh") - 1
+     AND so.status_code_order = "delivered"
+     AND so.country_code = "sa"
+     GROUP BY 1,2,3
+   ),
+   lat_long AS (
+     SELECT order_nr, lat, lng
+     FROM order_base sb
+     JOIN       dwh.customerexposed_customer_hashed.address_history ca ON sb.address_code = ca.address_code AND sb.address_version = ca.v_customer_address
+     GROUP BY 1,2,3
+   ),
+   polygon_ds AS (
+     SELECT wh_code, polygon
+     FROM       dwh.instant_instant_order.warehouse_polygon
+     WHERE is_beta = 0
+   ),
+   base AS (
+     SELECT p.wh_code, l.order_nr
+     FROM (
+       SELECT *, ST_GEOGPOINT(lng,lat) as geo
+       FROM lat_long
+     ) l
+     JOIN (
+       SELECT wh_code, polygon, ST_GEOGFROMTEXT(polygon) geo
+       FROM polygon_ds
+     ) p ON ST_WITHIN(l.geo, p.geo)
+   )
+   SELECT wh_code, order_nr
+   FROM base
+ ),
+  sales_master AS (
+   SELECT country_code, wh_code, date_, sku, COUNT(DISTINCT item_nr) as units_sold, ROUND(SAFE_DIVIDE(SUM(price), COUNT(DISTINCT item_nr)),2) as asp
+   FROM (
+     SELECT so.country_code, pwm.wh_code, DATE(so.created_at + INTERVAL 3 HOUR) as date_, so.order_nr, soi.sku, item_nr, soi.price
+     FROM       dwh.instant_instant_order.sales_order so
+     JOIN       dwh.instant_instant_order.sales_order_item soi ON soi.id_sales_order = so.id_sales_order
+     JOIN wh_polygon_mapping pwm ON pwm.order_nr = so.order_nr
+     WHERE so.country_code IN ("sa")
+     AND DATE(so.created_at + INTERVAL 3 HOUR) BETWEEN "2024-01-01" AND CURRENT_DATE("Asia/Riyadh") - 1
+     AND so.status_code_order = "delivered" AND soi.cancel_reason_code IS NULL
+     GROUP BY 1, 2, 3, 4, 5, 6, 7
+   )
+   GROUP BY 1,2,3,4
+ ),
+ base AS (
+   SELECT a.*,COALESCE(category, 'Not Defined') as category, COALESCE(b.units_sold,0) as units_sold, COALESCE(b.asp,a.asp) as avg_selling_price
+   FROM stock_master a
+   LEFT JOIN sales_master b ON a.wh_code = b.wh_code AND a.sku = b.sku AND a.date_ = b.date_
+   LEFT JOIN (
+     SELECT LOWER(country_code) as country_code, sku, INITCAP(REPLACE(category, "_", " ")) as category
+     FROM       biinstnt.minutes.minutes_commercial_category_mapping
+     GROUP BY 1,2,3
+   ) c ON a.sku = c.sku AND a.country_code = c.country_code
+ )  
+ SELECT country_code, wh_code, sku, category, date_, is_available, tot_available, units_sold, avg_selling_price, CURRENT_TIMESTAMP + INTERVAL 4 HOUR as last_updated_at
+ FROM base
+)
