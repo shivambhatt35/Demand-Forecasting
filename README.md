@@ -45,8 +45,8 @@ The solution integrates **data preparation**, **feature engineering**, and **tim
    - Adds cyclical features: `sin(hour)`, `cos(hour)`
 
 5. 🕵️ **Lag Feature Computation**  
-   - Lag-1, Lag-2, Lag-3 order count features  
-   - Enables short-term trend modeling
+   - Lag-1, Lag-2, Lag-3 order count features.
+   - Enables short-term trend modeling.
 
 6. 📦 **Final Dataset**  
    Output dataset is fully enriched, cleaned, and structured for **ML training or forecasting**.
