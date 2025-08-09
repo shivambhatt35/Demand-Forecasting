@@ -17,7 +17,7 @@ The solution integrates **data preparation**, **feature engineering**, and **tim
 
 ## Key Features
 
-| Feature ✅ | Description |
+| Feature   | Description |
 |-----------|-------------|
 | 🕒 **Hourly Forecasting** | Aggregates order counts at the hourly level for each warehouse and polygon. |
 | 📅 **Dense Time Grid** | Builds a continuous hourly grid ensuring no missing time slots. |
