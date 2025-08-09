@@ -1,11 +1,11 @@
-# 📈 Demand Forecasting with Time-Series Analysis
+# Demand Forecasting with Time-Series Analysis
 
 A robust, modular pipeline for **hourly demand prediction** using time-series analysis and machine learning.  
 Built for accurate **inventory management**, **supply chain optimization**, and **logistics forecasting**. 🚚📦
 
 ---
 
-## 🧠 Project Summary
+## Project Summary
 
 This project focuses on building a robust time-series forecasting pipeline for **demand prediction**, incorporating both statistical analysis and predictive analytics. Leveraging historical order and product availability data, the pipeline prepares granular hourly-level forecasts by warehouse and delivery polygons (geographical areas).
 
@@ -15,7 +15,7 @@ The solution integrates **data preparation**, **feature engineering**, and **tim
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
 | Feature ✅ | Description |
 |-----------|-------------|
@@ -29,7 +29,7 @@ The solution integrates **data preparation**, **feature engineering**, and **tim
 
 ---
 
-## ⚙️ How It Works
+## How It Works
 
 1. 🗃️ **Data Extraction**  
    Pulls order and product availability data from SQL sources based on selected date ranges.
@@ -53,7 +53,7 @@ The solution integrates **data preparation**, **feature engineering**, and **tim
 
 ---
 
-## 🧰 Tech Stack
+## Tech Stack
 
 | Tool / Library | Purpose |
 |----------------|---------|
@@ -66,7 +66,7 @@ The solution integrates **data preparation**, **feature engineering**, and **tim
 
 ---
 
-## 📌 Use Cases
+## Use Cases
 
 - 🚛 **Inventory Demand Planning**
 - 🛍️ **Retail & E-Commerce Forecasting**
