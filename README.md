@@ -95,10 +95,3 @@ This framework ensures that downstream **machine learning models or statistical 
 - **Interactive Dashboards:** Enable stakeholders to explore forecasts and historical trends visually.
 
 ---
-
-## Contact
-
-For questions, collaboration, or feedback, please reach out:  
-**Shivam Bhatt**  
-📧 Email: [your-email@example.com]  
-🔗 GitHub: [https://github.com/your-username](https://github.com/your-username)
