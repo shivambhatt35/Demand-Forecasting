@@ -1,4 +1,4 @@
-# Demand Forecasting with Time-Series Analysis
+# Demand Forecasting
 
 A **robust, modular pipeline** for **hourly demand prediction** leveraging time-series analysis and machine learning. Designed to optimize **inventory management**, **supply chain operations**, and **logistics forecasting** by generating highly granular, accurate forecasts.
 
