@@ -2,7 +2,6 @@
 
 A robust, modular pipeline for **hourly demand prediction** using time-series analysis and machine learning.  
 Built for accurate **inventory management**, **supply chain optimization**, and **logistics forecasting**.
----
 
 ## Project Summary
 
